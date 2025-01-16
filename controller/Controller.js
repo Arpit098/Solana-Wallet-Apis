@@ -32,7 +32,7 @@ const activateInactiveWallets = async (req, res) => {
     try {
         // Fetch wallets that are not active
         const result = await pool.query(
-            'SELECT wallet_public_key FROM wallet_solanawallets WHERE is_Listening = true'
+            'SELECT wallet_public_key FROM wallet_solanawallets WHERE is_Listening = false'
         );
 
         for (const { wallet_public_key } of result.rows) {
@@ -44,7 +44,7 @@ const activateInactiveWallets = async (req, res) => {
             }
             // Update the wallet to mark it as active
             await pool.query(
-                'UPDATE wallet_solanawallets SET is_active = true WHERE wallet_public_key = $1',
+                'UPDATE wallet_solanawallets SET is_Listening = true WHERE wallet_public_key = $1',
                 [wallet_public_key]
             );
 
@@ -138,12 +138,10 @@ const startWalletListener = async ({publicKey, network}) => {
             'UPDATE wallet_solanawallets SET is_listening = $1 WHERE wallet_public_key = $2',
             [true, walletPublicKey.toString()]
         );
-        // Subscribe to program with filters for the wallet address
         connection.onProgramAccountChange(
             new PublicKey(TOKEN_PROGRAM_ID),
             async (accountInfo, context) => {
                 try {
-                    // Get recent signatures for this account
                     const signatures = await connection.getSignaturesForAddress(
                         accountInfo.accountId,
                         { limit: 1 }
@@ -155,11 +153,6 @@ const startWalletListener = async ({publicKey, network}) => {
                         });
 
                         if (transaction && transaction.meta && transaction.meta.preTokenBalances && transaction.meta.postTokenBalances) {
-                            // Get token information for each token in the transaction
-                            // console.log('Transaction:', transaction);  
-                           
-                            // console.log('token balance reciever', transaction.meta.postTokenBalances[0]);
-                            // console.log("token mint:", transaction.meta.postTokenBalances[0].mint)
 
                             const token_transfered = Math.abs(transaction.meta.preTokenBalances[0].uiTokenAmount.uiAmount - transaction.meta.postTokenBalances[0].uiTokenAmount.uiAmount);
                             console.log("tokens transfered:", token_transfered)
@@ -197,7 +190,6 @@ const startWalletListener = async ({publicKey, network}) => {
             ]
         );
 
-        // Listen to SOL transactions (unchanged)
         connection.onLogs(
             walletPublicKey,
             async (logs, context) => {
@@ -209,24 +201,20 @@ const startWalletListener = async ({publicKey, network}) => {
           
                 if (transaction) {
                   let receivedSolAmount = 0;
-                  // Ensure both preBalances and postBalances are available in the transaction meta
                   if (transaction.meta.postBalances && transaction.meta.preBalances) {
                     const postBalances = transaction.meta.postBalances;
                     const preBalances = transaction.meta.preBalances;
                     
-                    // Find the indices for the sender and receiver (assuming walletPublicKey is one of them)
                     const senderIndex = transaction.transaction.message.accountKeys.findIndex(
                       (key) => key.toString() === walletPublicKey.toString()
                     );
           
                     if (senderIndex !== -1) {
-                      // This is the sender's balance (subtract from pre to get sent amount)
                       const balanceDifference = preBalances[senderIndex] - postBalances[senderIndex];
                       const fee = transaction.meta.fee;
                       receivedSolAmount = Math.abs((balanceDifference) / 1e9);
                   
                     } else {
-                      // If this wallet is the receiver, find the difference
                       const receiverIndex = transaction.transaction.message.accountKeys.findIndex(
                         (key) => key.toString() === walletPublicKey.toString()
                       );
@@ -239,7 +227,6 @@ const startWalletListener = async ({publicKey, network}) => {
                   }
           
                   console.log('\nNew SOL Transaction Detected for receiver amount:', receivedSolAmount);
-                  // Optionally update your database with the received amount
                   pool.query('UPDATE wallet_solanawallets SET balance = $1 WHERE wallet_public_key = $2', [receivedSolAmount, walletPublicKey.toString()]);
                 }
               } catch (error) {
@@ -261,20 +248,15 @@ const transferFunds = async (connection, mintAddress, receiverPublicKey, senderP
         const mintPubkey = new PublicKey(mintAddress);
         const receiverPubkey = new PublicKey(receiverPublicKey);
         const senderPubkey = new PublicKey(senderPublicKey);
-
-        // Get the sender's Keypair
         const senderKeypair = Keypair.fromSecretKey(Uint8Array.from(senderPrivateKey));
-
-        // Get the associated token addresses
         const senderTokenAddress = await getOrCreateAssociatedTokenAccount(connection, senderKeypair, mintPubkey, senderPubkey);
         const receiverTokenAddress = await getOrCreateAssociatedTokenAccount(connection, senderKeypair, mintPubkey, receiverPubkey);
 
-        // Create the transfer instruction
         const transferInstruction = createTransferInstruction(
-            senderTokenAddress, // Sender's token account
-            receiverTokenAddress, // Receiver's token account
-            senderPubkey, // Owner of sender's token account
-            amount, // Amount to transfer (example: 1 token, adjust decimals as needed)
+            senderTokenAddress, 
+            receiverTokenAddress,
+            senderPubkey, 
+            amount,
             TOKEN_PROGRAM_ID
         );
 
