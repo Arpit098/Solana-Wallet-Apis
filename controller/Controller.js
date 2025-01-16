@@ -1,8 +1,16 @@
 const { Keypair, Connection, clusterApiUrl, PublicKey } = require('@solana/web3.js');
 const bs58 = require('bs58'); 
 const bip39 = require('bip39'); 
+const { TOKEN_PROGRAM_ID, getAssociatedTokenAddress, createTransferInstruction, getOrCreateAssociatedTokenAccount } = require('@solana/spl-token');
+const pool = require('../db');
 const SPL_TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 
+const MINT_ADDRESS = {
+    ETH: 'Fb98oU1s54j2keETgEoLchcwBssFazMovEGJty9QZzxQ',
+    MATIC: 'SfiWoxTSeqNLX7efAmigSDFWJverfvoqzHBCSARExqU',
+    BTC: 'HpyCMAYz9XQC4qkJcLHNwFYasxmahs3ZX99rh8cutR46',
+    XRP: '6pUKSq43ddg2mBnMckoCXQhMcn2Hzs6tsyeeWFKF8zXE',
+}
 const createKeypair = (req, res) => {
     try {
         const keypair = Keypair.generate();
@@ -16,8 +24,36 @@ const createKeypair = (req, res) => {
         console.error('Error generating keypair:', error);
         res.status(500).json({ error: 'Internal Server Error' });
     }
+   
 };
 
+const activateInactiveWallets = async (req, res) => {
+
+    try {
+        // Fetch wallets that are not active
+        const result = await pool.query(
+            'SELECT wallet_public_key FROM wallet_solanawallets WHERE is_Listening = true'
+        );
+
+        for (const { wallet_public_key } of result.rows) {
+            console.log(`Activating wallet: ${wallet_public_key}`);
+
+            const networks = ['devnet', 'testnet', 'mainnet-beta'];
+            for(const network of networks) {
+                startWalletListener({publicKey: wallet_public_key, network});
+            }
+            // Update the wallet to mark it as active
+            await pool.query(
+                'UPDATE wallet_solanawallets SET is_active = true WHERE wallet_public_key = $1',
+                [wallet_public_key]
+            );
+
+            console.log(`Wallet marked as active: ${wallet_public_key}`);
+        }
+    } catch (error) {
+        console.error('Error activating inactive wallets:', error);
+    } 
+};
 
 const getBalance = async (req, res) => {
     const { publicKey, network } = req.body;
@@ -78,8 +114,8 @@ const getBalance = async (req, res) => {
 };
 
 
-const startWalletListener = async (req, res) => {
-    const { publicKey, network } = req.body;
+
+const startWalletListener = async ({publicKey, network}) => {
 
     if (!publicKey) {
         return res.status(404).json({ error: 'Wallet address is required' });
@@ -96,56 +132,235 @@ const startWalletListener = async (req, res) => {
         });
 
         const walletPublicKey = new PublicKey(publicKey);
-        const tokenProgramPublicKey = new PublicKey(SPL_TOKEN_PROGRAM_ID);
 
-        console.log(`Listening to wallet: ${publicKey} on ${network}`);
-
-        // Fetch all associated token accounts for the wallet
-        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(walletPublicKey, {
-            programId: tokenProgramPublicKey,
-        });
-
-        const associatedTokenAccounts = tokenAccounts.value.map(account => account.pubkey.toString());
-
-        console.log(`Associated Token Accounts: ${associatedTokenAccounts}`);
-
-        // Listen to all transactions involving the wallet (SOL transactions)
-        connection.onLogs(
-            walletPublicKey,
-            (logs, context) => {
-                console.log('\nNew SOL Transaction Detected:');
-                console.log('Transaction logs:', logs.logs);
-                console.log('Signature:', logs.signature);
-                console.log('Slot:', context.slot);
-            },
-            'confirmed'
+        console.log(`Starting listener for wallet: ${publicKey} on ${network}`);
+         await pool.query(
+            'UPDATE wallet_solanawallets SET is_listening = $1 WHERE wallet_public_key = $2',
+            [true, walletPublicKey.toString()]
         );
+        // Subscribe to program with filters for the wallet address
+        connection.onProgramAccountChange(
+            new PublicKey(TOKEN_PROGRAM_ID),
+            async (accountInfo, context) => {
+                try {
+                    // Get recent signatures for this account
+                    const signatures = await connection.getSignaturesForAddress(
+                        accountInfo.accountId,
+                        { limit: 1 }
+                    );
 
-        // Listen to SPL Token transactions
-        connection.onLogs(
-            tokenProgramPublicKey,
-            (logs, context) => {
-                const logString = logs.logs.join('\n');
+                    if (signatures.length > 0) {
+                        const transaction = await connection.getTransaction(signatures[0].signature, {
+                            maxSupportedTransactionVersion: 0
+                        });
 
-                // Check if any of the wallet's associated token accounts appear in the logs
-                const isWalletInvolved = associatedTokenAccounts.some(account => logString.includes(account));
+                        if (transaction && transaction.meta && transaction.meta.preTokenBalances && transaction.meta.postTokenBalances) {
+                            // Get token information for each token in the transaction
+                            // console.log('Transaction:', transaction);  
+                           
+                            // console.log('token balance reciever', transaction.meta.postTokenBalances[0]);
+                            // console.log("token mint:", transaction.meta.postTokenBalances[0].mint)
 
-                if (isWalletInvolved) {
-                    console.log('\nNew SPL Token Transaction Detected:');
-                    console.log('Transaction logs:', logs.logs);
-                    console.log('Signature:', logs.signature);
-                    console.log('Slot:', context.slot);
+                            const token_transfered = Math.abs(transaction.meta.preTokenBalances[0].uiTokenAmount.uiAmount - transaction.meta.postTokenBalances[0].uiTokenAmount.uiAmount);
+                            console.log("tokens transfered:", token_transfered)
+
+                            if(MINT_ADDRESS.ETH == transaction.meta.postTokenBalances[0].mint){
+                                console.log("ETH tokens transfered:", token_transfered)
+                                pool.query('UPDATE wallet_solanawallets SET eth = $1 WHERE wallet_public_key = $2', [token_transfered, walletPublicKey.toString()]);
+                            }
+                            else if(MINT_ADDRESS.BTC == transaction.meta.postTokenBalances[0].mint){
+                                console.log("BTC tokens transfered:", token_transfered)
+                                pool.query('UPDATE wallet_solanawallets SET btc = $1 WHERE wallet_public_key = $2', [token_transfered, walletPublicKey.toString()]);
+                            }
+                            else if(MINT_ADDRESS.XRP == transaction.meta.postTokenBalances[0].mint){
+                                console.log("XRP tokens transfered:", token_transfered)
+                                pool.query('UPDATE wallet_solanawallets SET xrp = $1 WHERE wallet_public_key = $2', [token_transfered, walletPublicKey.toString()]);
+                            }
+                            else if(MINT_ADDRESS.MATIC == transaction.meta.postTokenBalances[0].mint){
+                                console.log("MATIC tokens transfered:", token_transfered)
+                                pool.query('UPDATE wallet_solanawallets SET matic = $1 WHERE wallet_public_key = $2', [token_transfered, walletPublicKey.toString()]);
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error processing token transfer:', error);
                 }
             },
-            'confirmed'
+            'confirmed',
+            [
+                {
+                    memcmp: {
+                        offset: 32,
+                        bytes: walletPublicKey.toBase58()
+                    }
+                }
+            ]
         );
 
-        res.status(200).json({ message: `Started listening to wallet: ${publicKey} on ${network}` });
+        // Listen to SOL transactions (unchanged)
+        connection.onLogs(
+            walletPublicKey,
+            async (logs, context) => {
+              try {
+                const transaction = await connection.getTransaction(logs.signature, {
+                  maxSupportedTransactionVersion: 0,
+                });
+                console.log('Transaction:', transaction);
+          
+                if (transaction) {
+                  let receivedSolAmount = 0;
+                  // Ensure both preBalances and postBalances are available in the transaction meta
+                  if (transaction.meta.postBalances && transaction.meta.preBalances) {
+                    const postBalances = transaction.meta.postBalances;
+                    const preBalances = transaction.meta.preBalances;
+                    
+                    // Find the indices for the sender and receiver (assuming walletPublicKey is one of them)
+                    const senderIndex = transaction.transaction.message.accountKeys.findIndex(
+                      (key) => key.toString() === walletPublicKey.toString()
+                    );
+          
+                    if (senderIndex !== -1) {
+                      // This is the sender's balance (subtract from pre to get sent amount)
+                      const balanceDifference = preBalances[senderIndex] - postBalances[senderIndex];
+                      const fee = transaction.meta.fee;
+                      receivedSolAmount = Math.abs((balanceDifference) / 1e9);
+                  
+                    } else {
+                      // If this wallet is the receiver, find the difference
+                      const receiverIndex = transaction.transaction.message.accountKeys.findIndex(
+                        (key) => key.toString() === walletPublicKey.toString()
+                      );
+          
+                      if (receiverIndex !== -1) {
+                        const balanceDifference = postBalances[receiverIndex] - preBalances[receiverIndex];
+                        receivedSolAmount = balanceDifference / 1e9; // Convert from lamports to SOL
+                      }
+                    }
+                  }
+          
+                  console.log('\nNew SOL Transaction Detected for receiver amount:', receivedSolAmount);
+                  // Optionally update your database with the received amount
+                  pool.query('UPDATE wallet_solanawallets SET balance = $1 WHERE wallet_public_key = $2', [receivedSolAmount, walletPublicKey.toString()]);
+                }
+              } catch (error) {
+                console.error('Error processing SOL transaction:', error);
+              }
+            },
+            'confirmed'
+          );
+          
+        
     } catch (error) {
         console.error('Error in wallet listener:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
     }
 };
 
-module.exports = { createKeypair, getBalance, startWalletListener };
+const transferFunds = async (connection, mintAddress, receiverPublicKey, senderPublicKey, senderPrivateKey, amount) => {
+    try {
+        // Convert inputs to PublicKey objects
+        const mintPubkey = new PublicKey(mintAddress);
+        const receiverPubkey = new PublicKey(receiverPublicKey);
+        const senderPubkey = new PublicKey(senderPublicKey);
+
+        // Get the sender's Keypair
+        const senderKeypair = Keypair.fromSecretKey(Uint8Array.from(senderPrivateKey));
+
+        // Get the associated token addresses
+        const senderTokenAddress = await getOrCreateAssociatedTokenAccount(connection, senderKeypair, mintPubkey, senderPubkey);
+        const receiverTokenAddress = await getOrCreateAssociatedTokenAccount(connection, senderKeypair, mintPubkey, receiverPubkey);
+
+        // Create the transfer instruction
+        const transferInstruction = createTransferInstruction(
+            senderTokenAddress, // Sender's token account
+            receiverTokenAddress, // Receiver's token account
+            senderPubkey, // Owner of sender's token account
+            amount, // Amount to transfer (example: 1 token, adjust decimals as needed)
+            TOKEN_PROGRAM_ID
+        );
+
+        // Create a transaction
+        const tx = new Transaction();
+        tx.add(transferInstruction);
+
+        // Send and confirm the transaction
+        const signature = await sendAndConfirmTransaction(connection, transaction, [senderKeypair]);
+        console.log('Transfer successful, transaction signature:', signature);
+    } catch (error) {
+        console.error('Error transferring funds:', error);
+    }
+};
+
+const restartListeners = async (req, res) => {
+    try {
+        // Get all active listening wallets
+        const result = await pool.query(
+            'SELECT wallet_public_key FROM wallet_solanawallets WHERE is_listening = true'
+        );
+        console.log(`Found ${result.rows.length} active listeners to restart`);
+
+        const networks = ['devnet', 'testnet', 'mainnet-beta'];
+        let successCount = 0;
+        let failureCount = 0;
+
+        // Restart each wallet listener one by one
+        for (const { wallet_public_key } of result.rows) {
+            try {
+                console.log(`Restarting listeners for wallet: ${wallet_public_key}`);
+                
+                // First, disconnect existing listeners for each network
+                for (const network of networks) {
+                    const connection = new Connection(clusterApiUrl(network), {
+                        wsEndpoint: `wss://api.${network}.solana.com`,
+                        commitment: 'confirmed',
+                    });
+                    await disconnectWalletListener(connection, wallet_public_key);
+                }
+
+                // Mark wallet as not listening
+                await pool.query(
+                    'UPDATE wallet_solanawallets SET is_listening = false WHERE wallet_public_key = $1',
+                    [wallet_public_key]
+                );
+
+                // Brief wait to ensure clean disconnect
+                await new Promise(resolve => setTimeout(resolve, 100));
+
+                // Restart listeners for each network
+                for (const network of networks) {
+                    await startWalletListener({
+                        publicKey: wallet_public_key,
+                        network
+                    });
+                }
+
+                successCount++;
+                console.log(`Successfully restarted listeners for wallet: ${wallet_public_key}`);
+            } catch (error) {
+                failureCount++;
+                console.error(`Failed to restart listeners for wallet ${wallet_public_key}:`, error);
+            }
+
+            // Minimal delay between wallets
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        // Send response with results
+        res.json({
+            message: 'Listener restart operation completed',
+            totalWallets: result.rows.length,
+            successfulRestarts: successCount,
+            failedRestarts: failureCount
+        });
+
+    } catch (error) {
+        console.error('Error in restartListeners:', error);
+        res.status(500).json({
+            error: 'Failed to restart listeners',
+            details: error.message
+        });
+    }
+};
+
+
+module.exports = { createKeypair, getBalance, activateInactiveWallets };
 
