@@ -1,5 +1,5 @@
 const express = require('express');
-const { createKeypair, getBalance, activateInactiveWallets } = require('../controller/Controller');
+const { createKeypair, getBalance, activateInactiveWallets, fetchAllTransactions, transferSOL } = require('../controller/Controller');
 
 const router = express.Router();
 
@@ -7,5 +7,6 @@ const router = express.Router();
 router.get('/createKeypair', createKeypair);
 router.get('/getBalance', getBalance);
 router.get('/activateInactiveWallets', activateInactiveWallets);
-
+router.get('/getTransactions', fetchAllTransactions);
+router.get('/transact', transferSOL)
 module.exports = router;
