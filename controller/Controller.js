@@ -140,9 +140,9 @@ const startWalletListener = async ({publicKey, network}) => {
         return res.status(404).json({ error: 'Wallet address is required' });
     }
 
-    if (!network || !['devnet', 'testnet', 'mainnet-beta'].includes(network)) {
-        return res.status(400).json({ error: 'Valid network is required (devnet, testnet, mainnet-beta)' });
-    }
+    // if (!network || !['devnet', 'testnet', 'mainnet-beta'].includes(network)) {
+    //     return res.status(400).json({ error: 'Valid network is required (devnet, testnet, mainnet-beta)' });
+    // }
 
     try {
         const connection = new Connection(clusterApiUrl(network), {
