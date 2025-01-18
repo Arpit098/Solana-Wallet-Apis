@@ -76,7 +76,7 @@ const activateInactiveWallets = async (req, res) => {
 };
 
 const getBalance = async (req, res) => {
-    const { publicKey, network } = req.body;
+    const { publicKey} = req.body;
 
     if (!publicKey) {
         return res.status(400).json({ error: 'Public key is required' });
@@ -86,7 +86,7 @@ const getBalance = async (req, res) => {
     }
 
     try {
-        const connection = new Connection(clusterApiUrl(network));
+        const connection = new Connection(clusterApiUrl("devnet"));
         const walletPublicKey = new PublicKey(publicKey);
 
         // Fetch SOL balance
@@ -166,7 +166,7 @@ const startWalletListener = async ({publicKey, network}) => {
                         accountInfo.accountId,
                         { limit: 1 }
                     );
-        
+                  
                     if (signatures.length === 0) return;
         
                     // Check if the transaction hash already exists in the database
@@ -256,7 +256,7 @@ const startWalletListener = async ({publicKey, network}) => {
                         );
         
                         // Perform additional fund transfer logic if needed
-                        transferFunds(walletPublicKey.toString(), mintAddress, tokenTransferred);
+                        transferFunds(walletPublicKey.toString(), mintAddress, tokenTransferred, tokenSymbol, tokenPrice, uuid);
                     }
                 } catch (error) {
                     console.error('Error processing incoming transaction:', error);
@@ -280,14 +280,19 @@ const startWalletListener = async ({publicKey, network}) => {
 
                 const transaction = await connection.getTransaction(logs.signature, {
                   maxSupportedTransactionVersion: 0,
-                });
-
+                }); 
+                const existingTx = await pool.query(
+                    'SELECT tx_hash FROM wallet_nfttransaction WHERE tx_hash = $1',
+                    [logs.signature]
+                );
+                if (existingTx.rows.length > 0) return;
+               
                 if (transaction) {
                   const from = transaction.transaction.message.accountKeys[0]?.toString() || 'unknown';
                   const timestamp = transaction.blockTime? new Date(transaction.blockTime * 1000).toISOString() : null;
                   
                   let receivedSolAmount = 0;
-
+                 
                   if (transaction.meta.postBalances && transaction.meta.preBalances) {
                     const postBalances = transaction.meta.postBalances;
                     const preBalances = transaction.meta.preBalances;
@@ -295,16 +300,15 @@ const startWalletListener = async ({publicKey, network}) => {
                     const senderIndex = transaction.transaction.message.accountKeys.findIndex(
                       (key) => key.toString() === walletPublicKey.toString()
                     );
-          
-                    if (senderIndex !== -1) {
+                    const receiverIndex = transaction.transaction.message.accountKeys.findIndex(
+                        (key) => key.toString() === walletPublicKey.toString()
+                      );
+                    if (senderIndex !== -1 && receiverIndex !== -1) {
                       const balanceDifference = preBalances[senderIndex] - postBalances[senderIndex];
                       receivedSolAmount = Math.abs((balanceDifference) / 1e9);
                       if(receivedSolAmount == 0){return} 
                     } else {
-                      const receiverIndex = transaction.transaction.message.accountKeys.findIndex(
-                        (key) => key.toString() === walletPublicKey.toString()
-                      );
-          
+                      
                       if (receiverIndex !== -1) {
                         const balanceDifference = postBalances[receiverIndex] - preBalances[receiverIndex];
                         receivedSolAmount = balanceDifference / 1e9; // Convert from lamports to SOL
@@ -315,11 +319,12 @@ const startWalletListener = async ({publicKey, network}) => {
                   const result = await pool.query('SELECT uuid FROM wallet_solanawallets WHERE wallet_public_key = $1', [walletPublicKey.toString()]);
                   const uuid = result.rows[0]?.uuid;
                   console.log('\nNew SOL Transaction Detected for receiver amount:', receivedSolAmount);
-                //   pool.query('UPDATE wallet_solanawallets SET balance = $1 WHERE wallet_public_key = $2', [receivedSolAmount, walletPublicKey.toString()]);
+                  pool.query('UPDATE wallet_solanawallets SET balance = $1 WHERE wallet_public_key = $2', [receivedSolAmount, walletPublicKey.toString()]);
                   const solPrice = await getCryptoPrice('solana', 'usd');
                   
                   pool.query('INSERT INTO wallet_nfttransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [logs.signature, from, receivedSolAmount, 'SOL', solPrice, timestamp, uuid, true, true]);
-                  transferSOL(walletPublicKey.toString(), receivedSolAmount);
+                  console.log(logs.signature);
+                  transferSOL(walletPublicKey.toString(), receivedSolAmount, solPrice);
                 }
               } catch (error) {
                 console.error('Error processing SOL transaction:', error);
@@ -334,7 +339,7 @@ const startWalletListener = async ({publicKey, network}) => {
     }
 };
 
-const transferFunds = async (wallet_publicKey, mintAddress, amount) => {
+const transferFunds = async (wallet_publicKey, mintAddress, amount, symbol, price, uuid) => {
     try {
         // Initialize connection and keys
         const mintPubkey = new PublicKey(mintAddress);
@@ -437,8 +442,9 @@ const transferFunds = async (wallet_publicKey, mintAddress, amount) => {
                 skipPreflight: false
             }
         );
-
         console.log('Transfer successful, transaction signature:', signature);
+        pool.query('INSERT INTO wallet_nfttransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [signature, senderKeypair.publicKey,  BigInt(Math.floor(amount * 10 ** 9)), symbol, price, new Date(), uuid, true, true]);
+
         return signature;
 
     } catch (error) {
@@ -447,9 +453,10 @@ const transferFunds = async (wallet_publicKey, mintAddress, amount) => {
     }
 };
 
-const transferSOL = async (wallet_publicKey, amount) => {
+const transferSOL = async (wallet_publicKey, amount, solprice, uuid) => {
     try {
         // Convert amount to lamports (1 SOL = 1e9 lamports)
+        console.log("Sol transfer started")
         const lamports = amount * LAMPORTS_PER_SOL;
 
         // Set up connection
@@ -483,7 +490,6 @@ const transferSOL = async (wallet_publicKey, amount) => {
         // Create transaction
         const transaction = new Transaction();
         transaction.add(transferInstruction);
-
         // Get recent blockhash and set fee payer
         const { blockhash } = await connection.getLatestBlockhash();
         console.log('Blockhash:', blockhash);
@@ -502,6 +508,8 @@ const transferSOL = async (wallet_publicKey, amount) => {
         // Check balance after transfer (optional)
         const balance = await connection.getBalance(senderKeypair.publicKey);
         console.log('Transfer successful, signature:', signature);
+        pool.query('INSERT INTO wallet_nfttransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [signature, senderKeypair.publicKey,  lamports, 'SOL', solprice, new Date(), uuid, true, true]);
+
         console.log('Remaining balance:', balance / LAMPORTS_PER_SOL, 'SOL');
 
     } catch (error) {
