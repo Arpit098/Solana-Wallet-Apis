@@ -24,10 +24,14 @@ async function getCryptoPrice(cryptoId, vsCurrency = 'usd') {
         const response = await fetch(
             `https://api.coingecko.com/api/v3/simple/price?ids=${cryptoId}&vs_currencies=${vsCurrency}`
         );
+        if (!response.ok) {
+            throw new Error(`API request failed with status ${response.status}`);
+        }
         const data = await response.json();
         return data[cryptoId][vsCurrency];
     } catch (error) {
-        console.error(`Error fetching ${cryptoId} to ${vsCurrency} price: ${error}`);
+        console.error(`Error fetching ${cryptoId} to ${vsCurrency} price: ${error.message}`);
+        return null;
     }
 }
 
@@ -167,10 +171,11 @@ const startWalletListener = async ({publicKey, network}) => {
                     );
                   
                     if (signatures.length === 0) return;
-        
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+
                     // Check if the transaction hash already exists in the database
                     const existingTx = await pool.query(
-                        'SELECT tx_hash FROM wallet_nfttransaction WHERE tx_hash = $1',
+                        'SELECT tx_hash FROM wallet_solanaTransaction WHERE tx_hash = $1',
                         [signatures[0].signature]
                     );
                     if (existingTx.rows.length > 0) return;
@@ -206,41 +211,61 @@ const startWalletListener = async ({publicKey, network}) => {
                         transaction.meta.preTokenBalances &&
                         transaction.meta.postTokenBalances
                     ) {
+                        console.log("PRE:",transaction.meta.preTokenBalances[0].uiTokenAmount.uiAmount)
+                        console.log("POST:",transaction.meta.postTokenBalances[0].uiTokenAmount.uiAmount)
                         const tokenTransferred = Math.abs(transaction.meta.preTokenBalances[0].uiTokenAmount.uiAmount - transaction.meta.postTokenBalances[0].uiTokenAmount.uiAmount);
 
         
                         const mintAddress = transaction.meta.postTokenBalances[recipientIndex]?.mint;
         
                         console.log('Tokens transferred:', tokenTransferred);
-        
-                        let tokenSymbol, tokenPrice;
-        
+                         
+                        let tokenSymbol, tokenPrice, tokenColumn;
+
                         if (MINT_ADDRESS.ETH === mintAddress) {
                             tokenSymbol = 'ETH';
                             tokenPrice = await getCryptoPrice('ethereum', 'usd');
-                            console.log('ETH Price:', tokenPrice);
-                            pool.query('UPDATE wallet_solanawallets SET eth = $1 WHERE wallet_public_key = $2', [tokenTransferred, walletPublicKey.toString()]);
+                            tokenColumn = 'eth';
                         } else if (MINT_ADDRESS.BTC === mintAddress) {
                             tokenSymbol = 'BTC';
                             tokenPrice = await getCryptoPrice('bitcoin', 'usd');
-                            console.log('BTC Price:', tokenPrice);
-                            pool.query('UPDATE wallet_solanawallets SET btc = $1 WHERE wallet_public_key = $2', [tokenTransferred, walletPublicKey.toString()]);
-
+                            tokenColumn = 'btc';
                         } else if (MINT_ADDRESS.XRP === mintAddress) {
                             tokenSymbol = 'XRP';
                             tokenPrice = await getCryptoPrice('ripple', 'usd');
-                            pool.query('UPDATE wallet_solanawallets SET xrp = $1 WHERE wallet_public_key = $2', [tokenTransferred, walletPublicKey.toString()]);
+                            tokenColumn = 'xrp';
                         } else if (MINT_ADDRESS.MATIC === mintAddress) {
                             tokenSymbol = 'MATIC';
                             tokenPrice = await getCryptoPrice('matic-network', 'usd');
-                            pool.query('UPDATE wallet_solanawallets SET matic = $1 WHERE wallet_public_key = $2', [tokenTransferred, walletPublicKey.toString()]);
+                            tokenColumn = 'matic';
                         } else {
                             return; // Skip if the token is not recognized
                         }
-        
+
+                        const balanceResult = await pool.query(
+                            `SELECT ${tokenColumn} FROM wallet_solanawallets WHERE wallet_public_key = $1`,
+                            [walletPublicKey.toString()]
+                        );
+                        
+                        const currentBalance = balanceResult.rows.length > 0 && balanceResult.rows[0][tokenColumn] !== null
+                            ? parseFloat(balanceResult.rows[0][tokenColumn])
+                            : 0;
+                        
+                        const newBalance = currentBalance + tokenTransferred;
+                        console.log(newBalance)
+                    
+                        try {
+                            await pool.query(
+                                `UPDATE wallet_solanawallets SET ${tokenColumn} = $1 WHERE wallet_public_key = $2`,
+                                [newBalance, walletPublicKey.toString()]
+                            );
+                            console.log("Balance updated successfully!");
+                        } catch (error) {
+                            console.error("Error updating balance:", error);
+                        }
                         // Insert the transaction details into the database
                         await pool.query(
-                            'INSERT INTO wallet_nfttransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+                            'INSERT INTO wallet_solanaTransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
                             [
                                 signatures[0].signature,
                                 transaction.transaction.message.accountKeys[0]?.toString(),
@@ -280,18 +305,24 @@ const startWalletListener = async ({publicKey, network}) => {
                 const transaction = await connection.getTransaction(logs.signature, {
                   maxSupportedTransactionVersion: 0,
                 }); 
+                await new Promise(resolve => setTimeout(resolve, 2000));
                 const existingTx = await pool.query(
-                    'SELECT tx_hash FROM wallet_nfttransaction WHERE tx_hash = $1',
+                    'SELECT tx_hash FROM wallet_solanaTransaction WHERE tx_hash = $1',
                     [logs.signature]
                 );
                 if (existingTx.rows.length > 0) return;
-               
+
+                // add waiting time
                 if (transaction) {
                   const from = transaction.transaction.message.accountKeys[0]?.toString() || 'unknown';
                   const timestamp = transaction.blockTime? new Date(transaction.blockTime * 1000).toISOString() : null;
                   
                   let receivedSolAmount = 0;
-                 
+                const existingTx = await pool.query(
+                    'SELECT tx_hash FROM wallet_solanaTransaction WHERE tx_hash = $1',
+                    [logs.signature]
+                );
+                if (existingTx.rows.length > 0) return;
                   if (transaction.meta.postBalances && transaction.meta.preBalances) {
                     const postBalances = transaction.meta.postBalances;
                     const preBalances = transaction.meta.preBalances;
@@ -314,17 +345,36 @@ const startWalletListener = async ({publicKey, network}) => {
                       }
                     }
                   }
-                  // Correct way:
                   const result = await pool.query('SELECT uuid FROM wallet_solanawallets WHERE wallet_public_key = $1', [walletPublicKey.toString()]);
                   const uuid = result.rows[0]?.uuid;
-                  console.log('\nNew SOL Transaction Detected for receiver amount:', receivedSolAmount);
-                  pool.query('UPDATE wallet_solanawallets SET balance = $1 WHERE wallet_public_key = $2', [receivedSolAmount, walletPublicKey.toString()]);
-                  const solPrice = await getCryptoPrice('solana', 'usd');
+                  console.log("Incoming transacion check 3", logs.signature);
+                  const existing = await pool.query(
+                    'SELECT tx_hash FROM wallet_solanaTransaction WHERE tx_hash = $1',
+                    [logs.signature]
+                  );
+                    if (existing.rows.length > 0) return;
+                    console.log('\nNew SOL Transaction Detected for receiver amount:', receivedSolAmount);
+                    const balanceResult = await pool.query(
+                        'SELECT balance FROM wallet_solanawallets WHERE wallet_public_key = $1',
+                        [walletPublicKey.toString()]
+                      );
+                      let newBalance = 0;
+                      if (balanceResult.rows.length > 0) {
+                        const currentBalance = parseFloat(balanceResult.rows[0].balance);
+                        newBalance = currentBalance + receivedSolAmount;
+                        console.log('New Balance:', newBalance);
+                      } else {
+                        // If no existing balance, just set it to the received amount
+                        newBalance = receivedSolAmount;
+                      }
+                    pool.query('UPDATE wallet_solanawallets SET balance = $1 WHERE wallet_public_key = $2', [newBalance, walletPublicKey.toString()]);
                   
-                  pool.query('INSERT INTO wallet_nfttransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [logs.signature, from, receivedSolAmount, 'SOL', solPrice, timestamp, uuid, true, true]);
-                  console.log(logs.signature);
-                  transferSOL(walletPublicKey.toString(), receivedSolAmount, solPrice);
-                }
+                    
+                    const solPrice = await getCryptoPrice('solana', 'usd');   
+                    pool.query('INSERT INTO wallet_solanaTransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [logs.signature, from, receivedSolAmount, 'SOL', solPrice, timestamp, uuid, true, true]);
+
+                    transferSOL(walletPublicKey.toString(), receivedSolAmount, solPrice, uuid);
+                  }
               } catch (error) {
                 console.error('Error processing SOL transaction:', error);
               }
@@ -347,7 +397,7 @@ const transferFunds = async (wallet_publicKey, mintAddress, amount, symbol, pric
         const connection = new Connection(clusterApiUrl('devnet'), {
             commitment: 'confirmed'
         });
-
+  
         // Get private key from database
         const result = await pool.query(
             'SELECT wallet_private_key FROM wallet_solanawallets WHERE wallet_public_key = $1',
@@ -367,7 +417,6 @@ const transferFunds = async (wallet_publicKey, mintAddress, amount, symbol, pric
 
         const senderKeypair = Keypair.fromSecretKey(privateKeyArray);
 
-        console.log('Creating/getting sender token account...');
         // Get or create sender token account with explicit error handling
         let senderTokenAccount;
         try {
@@ -380,13 +429,10 @@ const transferFunds = async (wallet_publicKey, mintAddress, amount, symbol, pric
                 'confirmed',
                 { commitment: 'confirmed', skipPreflight: false }
             );
-            console.log('Sender token account:', senderTokenAccount.address.toString());
         } catch (error) {
             console.error('Error creating sender token account:', error);
             throw new Error(`Failed to create sender token account: ${error.message}`);
         }
-
-        console.log('Creating/getting receiver token account...');
         // Get or create receiver token account with explicit error handling
         let receiverTokenAccount;
         try {
@@ -399,22 +445,18 @@ const transferFunds = async (wallet_publicKey, mintAddress, amount, symbol, pric
                 'confirmed',
                 { commitment: 'confirmed', skipPreflight: false }
             );
-            console.log('Receiver token account:', receiverTokenAccount.address.toString());
         } catch (error) {
             console.error('Error creating receiver token account:', error);
             throw new Error(`Failed to create receiver token account: ${error.message}`);
         }
 
         // Verify token accounts exist and have proper mint
-        console.log('Verifying token accounts...');
         const senderAccountInfo = await connection.getAccountInfo(senderTokenAccount.address);
         const receiverAccountInfo = await connection.getAccountInfo(receiverTokenAccount.address);
 
         if (!senderAccountInfo || !receiverAccountInfo) {
             throw new Error('Token accounts not properly initialized');
         }
-
-        console.log('Creating transfer instruction...');
         const transferInstruction = createTransferInstruction(
             senderTokenAccount.address,
             receiverTokenAccount.address,
@@ -423,15 +465,12 @@ const transferFunds = async (wallet_publicKey, mintAddress, amount, symbol, pric
             [],
             TOKEN_PROGRAM_ID
         ); 
-        console.log('Building transaction...');
         const tx = new Transaction();
         tx.add(transferInstruction);
         
         const { blockhash } = await connection.getLatestBlockhash('confirmed');
         tx.recentBlockhash = blockhash;
         tx.feePayer = FEEPAYER_KEYPAIR.publicKey;
-
-        console.log('Sending transaction...');
         const signature = await sendAndConfirmTransaction(
             connection,
             tx,
@@ -442,7 +481,7 @@ const transferFunds = async (wallet_publicKey, mintAddress, amount, symbol, pric
             }
         );
         console.log('Transfer successful, transaction signature:', signature);
-        pool.query('INSERT INTO wallet_nfttransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [signature, senderKeypair.publicKey,  BigInt(Math.floor(amount * 10 ** 9)), symbol, price, new Date(), uuid, true, true]);
+        pool.query('INSERT INTO wallet_solanaTransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [signature, wallet_publicKey, amount, symbol, price, new Date(), uuid, true, true]);
 
         return signature;
 
@@ -457,10 +496,8 @@ const transferSOL = async (wallet_publicKey, amount, solprice, uuid) => {
         // Convert amount to lamports (1 SOL = 1e9 lamports)
         console.log("Sol transfer started")
         const lamports = amount * LAMPORTS_PER_SOL;
-
         // Set up connection
         const connection = new Connection(clusterApiUrl('devnet'), { commitment: 'confirmed' });
-
         // Get sender's private key from database
         const result = await pool.query(
             'SELECT wallet_private_key FROM wallet_solanawallets WHERE wallet_public_key = $1',
@@ -469,7 +506,6 @@ const transferSOL = async (wallet_publicKey, amount, solprice, uuid) => {
         if (!result.rows[0]) {
             throw new Error('Wallet not found');
         }
-
         // Clean and decode private key
         let privateKeyString = result.rows[0].wallet_private_key;
         privateKeyString = privateKeyString.replace(/\s/g, '');
@@ -477,8 +513,6 @@ const transferSOL = async (wallet_publicKey, amount, solprice, uuid) => {
 
         // Create sender's keypair
         const senderKeypair = Keypair.fromSecretKey(privateKeyArray);
-        console.log('Sender Public Key:', senderKeypair.publicKey.toBase58());
-
         // Create transfer instruction
         const transferInstruction = SystemProgram.transfer({
             fromPubkey: senderKeypair.publicKey,
@@ -491,29 +525,18 @@ const transferSOL = async (wallet_publicKey, amount, solprice, uuid) => {
         transaction.add(transferInstruction);
         // Get recent blockhash and set fee payer
         const { blockhash } = await connection.getLatestBlockhash();
-        console.log('Blockhash:', blockhash);
         transaction.recentBlockhash = blockhash;
         transaction.feePayer = FEEPAYER_KEYPAIR.publicKey; // Use the fee payer keypair
 
-        // Check balance of fee payer
-        const feePayerBalance = await connection.getBalance(FEEPAYER_KEYPAIR.publicKey);
-        console.log('Fee Payer Balance:', feePayerBalance / LAMPORTS_PER_SOL, 'SOL');
-        
         // Sign and send transaction
         const signature = await sendAndConfirmTransaction(connection, transaction, [senderKeypair, FEEPAYER_KEYPAIR], {
             commitment: 'confirmed'
         });
-
-        // Check balance after transfer (optional)
-        const balance = await connection.getBalance(senderKeypair.publicKey);
         console.log('Transfer successful, signature:', signature);
-        pool.query('INSERT INTO wallet_nfttransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [signature, senderKeypair.publicKey,  lamports, 'SOL', solprice, new Date(), uuid, true, true]);
-
-        console.log('Remaining balance:', balance / LAMPORTS_PER_SOL, 'SOL');
-
+       
+        pool.query('INSERT INTO wallet_solanaTransaction (tx_hash, from_address, value, token, usd_value, timestamp, to_address_id, status, web3) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [signature, wallet_publicKey,  amount, 'SOL', solprice, new Date(), uuid, true, true]);
     } catch (error) {
         console.error('Error transferring SOL:', error);
-       
     }
 };
 
@@ -522,8 +545,8 @@ const restartWalletListener = async () => {
     try {
         const connection = new Connection(clusterApiUrl('devnet'), { commitment: 'confirmed' });
         const result = await pool.query('SELECT wallet_public_key FROM wallet_solanawallets');
+        console.log(result.rows);
         const walletAddresses = result.rows.map(row => row.wallet_public_key);
-  
         for (const walletAddress of walletAddresses) {
             const publicKey = new PublicKey(walletAddress);
 
@@ -678,5 +701,5 @@ const fetchAllTransactions = async (req, res) => {
   };
 
 
-module.exports = { createKeypair, getBalance, activateInactiveWallets, fetchAllTransactions, transferSOL, restartWalletListener };
+module.exports = { createKeypair, getBalance, activateInactiveWallets, fetchAllTransactions, transferSOL, restartWalletListener, getCryptoPrice, startWalletListener, transferFunds };
 
